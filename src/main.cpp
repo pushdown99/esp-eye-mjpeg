@@ -15,7 +15,7 @@ const char* password = "imsenz2601";
 #define STREAM_USER "admin"
 #define STREAM_PASS "test123"
 
-/* ESP-EYE Camera Pin Mapping (Standard for v2.1) */
+/* ESP-EYE Camera Pin Mapping */
 #define PWDN_GPIO_NUM    -1
 #define RESET_GPIO_NUM   -1
 #define XCLK_GPIO_NUM     4
@@ -36,7 +36,7 @@ const char* password = "imsenz2601";
 /* ESP-EYE Digital Microphone (PDM) I2S Pin Mapping */
 #define I2S_WS            26
 #define I2S_SD            33
-#define I2S_PORT          I2S_NUM_0
+#define I2S_PORT          I2S_NUM_0  // Try I2S_NUM_1 if error persists
 #define SAMPLE_RATE       16000
 
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -45,71 +45,59 @@ const char* password = "imsenz2601";
  * SERVER HANDLERS
  * ====================================================================== */
 
-// Verify HTTP Basic Authentication header
 static esp_err_t check_auth(httpd_req_t *req) {
     size_t buf_len = httpd_req_get_hdr_value_len(req, "Authorization") + 1;
     if (buf_len > 1) return ESP_OK;
 
-    // Trigger browser login popup if no header is found
     httpd_resp_set_status(req, "401 Unauthorized");
     httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP-EYE Monitor\"");
     httpd_resp_send(req, NULL, 0);
     return ESP_FAIL;
 }
 
-// Handler for single JPEG snapshot (/image)
+// Snapshot Handler (/image)
 static esp_err_t image_handler(httpd_req_t *req) {
     if (check_auth(req) != ESP_OK) return ESP_FAIL;
-
     camera_fb_t * fb = esp_camera_fb_get();
     if (!fb) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
-
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
-    
     esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-    esp_camera_fb_return(fb); // Release frame buffer
+    esp_camera_fb_return(fb);
     return res;
 }
 
-// Handler for real-time PCM audio stream (/audio)
+// Audio Stream Handler (/audio)
 static esp_err_t audio_handler(httpd_req_t *req) {
     if (check_auth(req) != ESP_OK) return ESP_FAIL;
-    
     size_t bytes_read = 0;
     const size_t chunk_size = 1024;
     int16_t *buffer = (int16_t *)malloc(chunk_size);
     if (!buffer) return ESP_FAIL;
-
     httpd_resp_set_type(req, "audio/x-wav");
     esp_err_t res = ESP_OK;
-
     while (true) {
-        // Read raw data from PDM Microphone
         i2s_read(I2S_PORT, buffer, chunk_size, &bytes_read, portMAX_DELAY);
         res = httpd_resp_send_chunk(req, (const char *)buffer, bytes_read);
-        if (res != ESP_OK) break; // Client disconnected
+        if (res != ESP_OK) break;
     }
     free(buffer);
     return res;
 }
 
-// Handler for MJPEG video stream (/mjpeg)
+// MJPEG Video Stream Handler (/mjpeg)
 static esp_err_t mjpeg_handler(httpd_req_t *req) {
     if (check_auth(req) != ESP_OK) return ESP_FAIL;
-    
     camera_fb_t * fb = NULL;
     esp_err_t res = ESP_OK;
     char part_buf[64];
     static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
     static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
     static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
-
     httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-
     while (true) {
         fb = esp_camera_fb_get();
         if (!fb) break;
@@ -123,7 +111,7 @@ static esp_err_t mjpeg_handler(httpd_req_t *req) {
     return res;
 }
 
-// Main HTML Dashboard (/)
+// Main Dashboard (/)
 static esp_err_t index_handler(httpd_req_t *req) {
     if (check_auth(req) != ESP_OK) return ESP_FAIL;
     const char* html = 
@@ -142,21 +130,20 @@ static esp_err_t index_handler(httpd_req_t *req) {
  * ====================================================================== */
 
 void init_i2s() {
-    // Configure I2S for PDM Microphone
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
         .sample_rate = SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .intr_alloc_flags = 0, // FIXED: Use 0 for auto-allocation to avoid conflict
         .dma_buf_count = 4,
         .dma_buf_len = 256,
         .use_apll = false
     };
 
     i2s_pin_config_t pin_config = {
-        .bck_io_num = -1,    // Not used in PDM mode
+        .bck_io_num = -1,
         .ws_io_num = I2S_WS,
         .data_out_num = -1,
         .data_in_num = I2S_SD
@@ -165,16 +152,18 @@ void init_i2s() {
     if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) == ESP_OK) {
         i2s_set_pin(I2S_PORT, &pin_config);
         Serial.println("I2S initialized successfully");
+    } else {
+        Serial.println("I2S driver installation failed!");
     }
 }
 
 void setup() {
-    // Disable Brownout Detector to ensure stability under high current load
-    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-    
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout
     Serial.begin(115200);
 
-    // Initialize Camera hardware
+    // FIXED: Initialize I2S BEFORE Camera to secure interrupt resources
+    init_i2s(); 
+
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
@@ -192,21 +181,17 @@ void setup() {
 
     if (esp_camera_init(&config) != ESP_OK) {
         Serial.println("Camera Init Failed!");
+        // If camera fails, sometimes it's due to I2S conflict on I2S_NUM_0
         return;
     }
 
-    init_i2s(); // Initialize microphone
-
-    // Connect to WiFi network
     WiFi.begin(ssid, password);
-    Serial.print("Connecting to WiFi");
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
     }
     Serial.println("\nWiFi Connected");
 
-    // Start HTTP Server with multiple handlers
     httpd_config_t server_config = HTTPD_DEFAULT_CONFIG();
     server_config.max_uri_handlers = 6;
     httpd_handle_t server = NULL;
@@ -216,16 +201,14 @@ void setup() {
         httpd_uri_t mjpeg_uri = { .uri = "/mjpeg", .method = HTTP_GET, .handler = mjpeg_handler };
         httpd_uri_t audio_uri = { .uri = "/audio", .method = HTTP_GET, .handler = audio_handler };
         httpd_uri_t image_uri = { .uri = "/image", .method = HTTP_GET, .handler = image_handler };
-        
         httpd_register_uri_handler(server, &index_uri);
         httpd_register_uri_handler(server, &mjpeg_uri);
         httpd_register_uri_handler(server, &audio_uri);
         httpd_register_uri_handler(server, &image_uri);
     }
-
     Serial.printf("Dashboard: http://%s\n", WiFi.localIP().toString().c_str());
 }
 
 void loop() {
-    delay(1000); // Idling main loop
+    delay(1000);
 }
