@@ -7,7 +7,7 @@
 #include "soc/rtc_cntl_reg.h"  // Required for Brownout settings
 
 /* ======================================================================
- * NETWORK & AUTHENTICATION CONFIGURATION
+ * CONFIGURATION
  * ====================================================================== */
 const char* ssid = "imsenz";
 const char* password = "imsenz2601";
@@ -33,10 +33,11 @@ const char* password = "imsenz2601";
 #define HREF_GPIO_NUM    27
 #define PCLK_GPIO_NUM    25
 
-/* ESP-EYE Digital Microphone (PDM) I2S Pin Mapping */
+/* ESP-EYE Microphone I2S Pin Mapping */
 #define I2S_WS            26
 #define I2S_SD            33
-#define I2S_PORT          I2S_NUM_0  // Try I2S_NUM_1 if error persists
+/* FIXED: Using I2S_NUM_1 to avoid conflict with Camera HAL on Port 0 */
+#define I2S_PORT          I2S_NUM_1 
 #define SAMPLE_RATE       16000
 
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -59,10 +60,8 @@ static esp_err_t check_auth(httpd_req_t *req) {
 static esp_err_t image_handler(httpd_req_t *req) {
     if (check_auth(req) != ESP_OK) return ESP_FAIL;
     camera_fb_t * fb = esp_camera_fb_get();
-    if (!fb) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+    if (!fb) { httpd_resp_send_500(req); return ESP_FAIL; }
+
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
     esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
@@ -77,6 +76,7 @@ static esp_err_t audio_handler(httpd_req_t *req) {
     const size_t chunk_size = 1024;
     int16_t *buffer = (int16_t *)malloc(chunk_size);
     if (!buffer) return ESP_FAIL;
+
     httpd_resp_set_type(req, "audio/x-wav");
     esp_err_t res = ESP_OK;
     while (true) {
@@ -88,7 +88,7 @@ static esp_err_t audio_handler(httpd_req_t *req) {
     return res;
 }
 
-// MJPEG Video Stream Handler (/mjpeg)
+// MJPEG Stream Handler (/mjpeg)
 static esp_err_t mjpeg_handler(httpd_req_t *req) {
     if (check_auth(req) != ESP_OK) return ESP_FAIL;
     camera_fb_t * fb = NULL;
@@ -97,6 +97,7 @@ static esp_err_t mjpeg_handler(httpd_req_t *req) {
     static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
     static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
     static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
     httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     while (true) {
         fb = esp_camera_fb_get();
@@ -111,7 +112,7 @@ static esp_err_t mjpeg_handler(httpd_req_t *req) {
     return res;
 }
 
-// Main Dashboard (/)
+// Dashboard Handler (/)
 static esp_err_t index_handler(httpd_req_t *req) {
     if (check_auth(req) != ESP_OK) return ESP_FAIL;
     const char* html = 
@@ -120,7 +121,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<h2>ESP-EYE Live Monitor</h2>"
         "<div style='margin-bottom:15px;'><img src='/mjpeg' style='width:90%; max-width:640px; border:2px solid #333;'></div>"
         "<div><p>Live Audio</p><audio autoplay controls style='width:90%; max-width:640px;'><source src='/audio' type='audio/x-wav'></audio></div>"
-        "<div style='margin-top:20px; font-size:1.2em;'><a href='/image' target='_blank' style='color:#00d1b2;'>[ View Snapshot ]</a></div>"
+        "<div style='margin-top:20px; font-size:1.1em;'>"
+        "<a href='/image' target='_blank' style='color:#00d1b2;'>[ Snapshot ]</a></div>"
         "</body></html>";
     return httpd_resp_send(req, html, strlen(html));
 }
@@ -130,16 +132,21 @@ static esp_err_t index_handler(httpd_req_t *req) {
  * ====================================================================== */
 
 void init_i2s() {
+    // 1. Force uninstall to clear HAL states before re-installation
+    i2s_driver_uninstall(I2S_PORT);
+
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
         .sample_rate = SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = 0, // FIXED: Use 0 for auto-allocation to avoid conflict
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 4,
         .dma_buf_len = 256,
-        .use_apll = false
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
     };
 
     i2s_pin_config_t pin_config = {
@@ -151,19 +158,19 @@ void init_i2s() {
 
     if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) == ESP_OK) {
         i2s_set_pin(I2S_PORT, &pin_config);
-        Serial.println("I2S initialized successfully");
-    } else {
-        Serial.println("I2S driver installation failed!");
+        i2s_zero_dma_buffer(I2S_PORT); // Clear noise
+        Serial.println("I2S initialized on PORT 1");
     }
 }
 
 void setup() {
-    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout
+    // Disable brownout to handle peak power consumption
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+    
     Serial.begin(115200);
+    delay(1000);
 
-    // FIXED: Initialize I2S BEFORE Camera to secure interrupt resources
-    init_i2s(); 
-
+    // STEP 1: Initialize Camera. HAL will try to grab I2S_NUM_0.
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
@@ -179,12 +186,16 @@ void setup() {
     config.jpeg_quality = 12;
     config.fb_count = 2;
 
-    if (esp_camera_init(&config) != ESP_OK) {
-        Serial.println("Camera Init Failed!");
-        // If camera fails, sometimes it's due to I2S conflict on I2S_NUM_0
-        return;
+    if (esp_camera_init(&config) == ESP_OK) {
+        Serial.println("Camera Init OK");
+    } else {
+        Serial.println("Camera Init FAIL");
     }
 
+    // STEP 2: Initialize I2S on PORT 1 AFTER camera setup
+    init_i2s(); 
+
+    // STEP 3: Connect WiFi
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
@@ -192,8 +203,9 @@ void setup() {
     }
     Serial.println("\nWiFi Connected");
 
+    // STEP 4: Start HTTP Server
     httpd_config_t server_config = HTTPD_DEFAULT_CONFIG();
-    server_config.max_uri_handlers = 6;
+    server_config.max_uri_handlers = 8;
     httpd_handle_t server = NULL;
     
     if (httpd_start(&server, &server_config) == ESP_OK) {
@@ -201,6 +213,7 @@ void setup() {
         httpd_uri_t mjpeg_uri = { .uri = "/mjpeg", .method = HTTP_GET, .handler = mjpeg_handler };
         httpd_uri_t audio_uri = { .uri = "/audio", .method = HTTP_GET, .handler = audio_handler };
         httpd_uri_t image_uri = { .uri = "/image", .method = HTTP_GET, .handler = image_handler };
+        
         httpd_register_uri_handler(server, &index_uri);
         httpd_register_uri_handler(server, &mjpeg_uri);
         httpd_register_uri_handler(server, &audio_uri);
