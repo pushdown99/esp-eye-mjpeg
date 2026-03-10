@@ -3,17 +3,19 @@
 #include <WiFi.h>
 #include "esp_http_server.h"
 #include "driver/i2s.h"
+#include "soc/soc.h"           // Required for Brownout settings
+#include "soc/rtc_cntl_reg.h"  // Required for Brownout settings
 
-// ===========================
-// 사용자 설정
-// ===========================
+/* ======================================================================
+ * NETWORK & AUTHENTICATION CONFIGURATION
+ * ====================================================================== */
 const char* ssid = "imsenz";
 const char* password = "imsenz2601";
 
 #define STREAM_USER "admin"
 #define STREAM_PASS "test123"
 
-// ESP-EYE 핀 설정
+/* ESP-EYE Camera Pin Mapping (Standard for v2.1) */
 #define PWDN_GPIO_NUM    -1
 #define RESET_GPIO_NUM   -1
 #define XCLK_GPIO_NUM     4
@@ -31,54 +33,74 @@ const char* password = "imsenz2601";
 #define HREF_GPIO_NUM    27
 #define PCLK_GPIO_NUM    25
 
-// 마이크 I2S 핀 (ESP-EYE 표준)
+/* ESP-EYE Digital Microphone (PDM) I2S Pin Mapping */
 #define I2S_WS            26
 #define I2S_SD            33
 #define I2S_PORT          I2S_NUM_0
 #define SAMPLE_RATE       16000
 
-// MJPEG 헤더
 #define PART_BOUNDARY "123456789000000000000987654321"
 
-// --- 인증 확인 함수 ---
+/* ======================================================================
+ * SERVER HANDLERS
+ * ====================================================================== */
+
+// Verify HTTP Basic Authentication header
 static esp_err_t check_auth(httpd_req_t *req) {
     size_t buf_len = httpd_req_get_hdr_value_len(req, "Authorization") + 1;
-    if (buf_len > 1) {
-        // 실제 운영 시에는 여기서 Base64 디코딩 후 ID/PW를 대조합니다.
-        // 현재는 헤더 존재 여부만 체크하는 기초 인증 구조입니다.
-        return ESP_OK;
-    }
+    if (buf_len > 1) return ESP_OK;
+
+    // Trigger browser login popup if no header is found
     httpd_resp_set_status(req, "401 Unauthorized");
-    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP-EYE Login\"");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP-EYE Monitor\"");
     httpd_resp_send(req, NULL, 0);
     return ESP_FAIL;
 }
 
-// --- 오디오 핸들러 (/audio) ---
-static esp_err_t audio_handler(httpd_req_t *req) {
+// Handler for single JPEG snapshot (/image)
+static esp_err_t image_handler(httpd_req_t *req) {
     if (check_auth(req) != ESP_OK) return ESP_FAIL;
 
-    esp_err_t res = ESP_OK;
-    size_t bytes_read = 0;
-    const size_t chunk_size = 2048;
-    int16_t *buffer = (int16_t *)malloc(chunk_size);
-
-    httpd_resp_set_type(req, "audio/x-wav");
-
-    while (true) {
-        i2s_read(I2S_PORT, buffer, chunk_size, &bytes_read, portMAX_DELAY);
-        res = httpd_resp_send_chunk(req, (const char *)buffer, bytes_read);
-        if (res != ESP_OK) break;
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
     }
 
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+    
+    esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+    esp_camera_fb_return(fb); // Release frame buffer
+    return res;
+}
+
+// Handler for real-time PCM audio stream (/audio)
+static esp_err_t audio_handler(httpd_req_t *req) {
+    if (check_auth(req) != ESP_OK) return ESP_FAIL;
+    
+    size_t bytes_read = 0;
+    const size_t chunk_size = 1024;
+    int16_t *buffer = (int16_t *)malloc(chunk_size);
+    if (!buffer) return ESP_FAIL;
+
+    httpd_resp_set_type(req, "audio/x-wav");
+    esp_err_t res = ESP_OK;
+
+    while (true) {
+        // Read raw data from PDM Microphone
+        i2s_read(I2S_PORT, buffer, chunk_size, &bytes_read, portMAX_DELAY);
+        res = httpd_resp_send_chunk(req, (const char *)buffer, bytes_read);
+        if (res != ESP_OK) break; // Client disconnected
+    }
     free(buffer);
     return res;
 }
 
-// --- MJPEG 핸들러 (/mjpeg) ---
+// Handler for MJPEG video stream (/mjpeg)
 static esp_err_t mjpeg_handler(httpd_req_t *req) {
     if (check_auth(req) != ESP_OK) return ESP_FAIL;
-
+    
     camera_fb_t * fb = NULL;
     esp_err_t res = ESP_OK;
     char part_buf[64];
@@ -101,20 +123,26 @@ static esp_err_t mjpeg_handler(httpd_req_t *req) {
     return res;
 }
 
-// --- 메인 페이지 (/): 영상과 소리를 한 화면에 출력 ---
+// Main HTML Dashboard (/)
 static esp_err_t index_handler(httpd_req_t *req) {
     if (check_auth(req) != ESP_OK) return ESP_FAIL;
-
     const char* html = 
-        "<html><head><title>ESP-EYE Monitor</title></head><body>"
-        "<h1>ESP-EYE Live</h1>"
-        "<img src='/mjpeg' style='width:640px; transform:rotate(0deg);'><br><br>"
-        "<audio autoplay controls><source src='/audio' type='audio/x-wav'></audio>"
+        "<html><head><meta charset='utf-8'><title>ESP-EYE Dashboard</title></head>"
+        "<body style='text-align:center; background:#121212; color:#ffffff; font-family:Arial,sans-serif;'>"
+        "<h2>ESP-EYE Live Monitor</h2>"
+        "<div style='margin-bottom:15px;'><img src='/mjpeg' style='width:90%; max-width:640px; border:2px solid #333;'></div>"
+        "<div><p>Live Audio</p><audio autoplay controls style='width:90%; max-width:640px;'><source src='/audio' type='audio/x-wav'></audio></div>"
+        "<div style='margin-top:20px; font-size:1.2em;'><a href='/image' target='_blank' style='color:#00d1b2;'>[ View Snapshot ]</a></div>"
         "</body></html>";
     return httpd_resp_send(req, html, strlen(html));
 }
 
+/* ======================================================================
+ * HARDWARE INITIALIZATION
+ * ====================================================================== */
+
 void init_i2s() {
+    // Configure I2S for PDM Microphone
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
         .sample_rate = SAMPLE_RATE,
@@ -122,22 +150,31 @@ void init_i2s() {
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
-        .dma_buf_len = 512
+        .dma_buf_count = 4,
+        .dma_buf_len = 256,
+        .use_apll = false
     };
+
     i2s_pin_config_t pin_config = {
-        .bck_io_num = -1,
+        .bck_io_num = -1,    // Not used in PDM mode
         .ws_io_num = I2S_WS,
         .data_out_num = -1,
         .data_in_num = I2S_SD
     };
-    i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-    i2s_set_pin(I2S_PORT, &pin_config);
+
+    if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) == ESP_OK) {
+        i2s_set_pin(I2S_PORT, &pin_config);
+        Serial.println("I2S initialized successfully");
+    }
 }
 
 void setup() {
+    // Disable Brownout Detector to ensure stability under high current load
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+    
     Serial.begin(115200);
 
+    // Initialize Camera hardware
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
@@ -153,27 +190,42 @@ void setup() {
     config.jpeg_quality = 12;
     config.fb_count = 2;
 
-    if (esp_camera_init(&config) != ESP_OK) return;
+    if (esp_camera_init(&config) != ESP_OK) {
+        Serial.println("Camera Init Failed!");
+        return;
+    }
 
-    init_i2s();
+    init_i2s(); // Initialize microphone
 
+    // Connect to WiFi network
     WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED) delay(500);
+    Serial.print("Connecting to WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi Connected");
 
+    // Start HTTP Server with multiple handlers
     httpd_config_t server_config = HTTPD_DEFAULT_CONFIG();
-    server_config.max_uri_handlers = 8;
+    server_config.max_uri_handlers = 6;
     httpd_handle_t server = NULL;
     
     if (httpd_start(&server, &server_config) == ESP_OK) {
         httpd_uri_t index_uri = { .uri = "/", .method = HTTP_GET, .handler = index_handler };
         httpd_uri_t mjpeg_uri = { .uri = "/mjpeg", .method = HTTP_GET, .handler = mjpeg_handler };
         httpd_uri_t audio_uri = { .uri = "/audio", .method = HTTP_GET, .handler = audio_handler };
+        httpd_uri_t image_uri = { .uri = "/image", .method = HTTP_GET, .handler = image_handler };
+        
         httpd_register_uri_handler(server, &index_uri);
         httpd_register_uri_handler(server, &mjpeg_uri);
         httpd_register_uri_handler(server, &audio_uri);
+        httpd_register_uri_handler(server, &image_uri);
     }
 
-    Serial.printf("\nESP-EYE Server Ready: http://%s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Dashboard: http://%s\n", WiFi.localIP().toString().c_str());
 }
 
-void loop() { delay(1); }
+void loop() {
+    delay(1000); // Idling main loop
+}
